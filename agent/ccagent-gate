@@ -4,9 +4,9 @@ umask 077
 CONF=${CCAGENT_CONF:-/etc/ccagent.conf}
 DIR=/var/lib/ccagent; [ -r "$CONF" ] && . "$CONF"
 LOG=$DIR/metrics.jsonl
+POWER_UNIT=${POWER_UNIT:-/etc/systemd/system/ccagent-power.path}
 set -- $SSH_ORIGINAL_COMMAND
 verb=${1:-}
-SYSCTL=${SYSTEMCTL:-/usr/bin/systemctl}
 case "$verb" in
   read)
     [ -s "$LOG" ] && mv "$LOG" "$DIR/metrics.$(date +%s%N).reading"
@@ -21,10 +21,9 @@ case "$verb" in
     echo ok ;;
   info) cat "$DIR/static.json" ;;
   power-off|reboot)
-    if ! command -v sudo >/dev/null 2>&1 || [ ! -f /etc/sudoers.d/ccagent ]; then
-      echo "power control unavailable: no sudo rule on this unit" >&2; exit 3
-    fi
-    echo ok
-    if [ "$verb" = power-off ]; then sudo -n "$SYSCTL" "power""off"; else sudo -n "$SYSCTL" "re""boot"; fi ;;
+    # No sudo needed: drop a request file; a root-owned systemd path unit picks it up and runs the matching action.
+    [ -f "$POWER_UNIT" ] || { echo "power control not installed on this unit: re-run the installer to enable it" >&2; exit 3; }
+    if [ "$verb" = power-off ]; then act=poweroff; else act=reboot; fi
+    printf '%s\n' "$act" > "$DIR/power.request" && echo ok ;;
   *) echo "denied" >&2; exit 2 ;;
 esac

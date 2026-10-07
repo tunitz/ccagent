@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Runs as root via ccagent-power.service, triggered by systemd when /var/lib/ccagent/power.request appears.
+# It accepts exactly two words and nothing else, so the unprivileged agent user can only ask for power-off or reboot.
+REQ=${CCAGENT_REQ:-/var/lib/ccagent/power.request}
+SYSCTL=${CCAGENT_SYSTEMCTL:-/usr/bin/systemctl}
+[ -f "$REQ" ] || exit 0
+action=$(head -c 16 "$REQ" | tr -d '\n\r ')
+age=$(( $(date +%s) - $(stat -c %Y "$REQ") ))
+rm -f "$REQ"
+[ "$age" -le 120 ] || exit 0   # stale request left from before a boot: never act on it
+case "$action" in
+  poweroff) exec "$SYSCTL" poweroff ;;
+  reboot)   exec "$SYSCTL" reboot ;;
+  *) exit 0 ;;
+esac
