@@ -20,7 +20,11 @@ case "$verb" in
     for f in "$DIR"/metrics.*.reading; do b=${f##*/}; m=${b#metrics.}; m=${m%.reading}; [ "$m" -le "$n" ] && rm -f "$f"; done
     echo ok ;;
   info) cat "$DIR/static.json" ;;
-  power-off) echo ok; sudo -n "$SYSCTL" "power""off" ;;
-  reboot) echo ok; sudo -n "$SYSCTL" "re""boot" ;;
+  power-off|reboot)
+    if ! command -v sudo >/dev/null 2>&1 || [ ! -f /etc/sudoers.d/ccagent ]; then
+      echo "power control unavailable: no sudo rule on this unit" >&2; exit 3
+    fi
+    echo ok
+    if [ "$verb" = power-off ]; then sudo -n "$SYSCTL" "power""off"; else sudo -n "$SYSCTL" "re""boot"; fi ;;
   *) echo "denied" >&2; exit 2 ;;
 esac
