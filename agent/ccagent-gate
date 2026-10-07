@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Forced command for the Control Center key. Only these verbs are accepted.
+umask 077
+CONF=${CCAGENT_CONF:-/etc/ccagent.conf}
+DIR=/var/lib/ccagent; [ -r "$CONF" ] && . "$CONF"
+LOG=$DIR/metrics.jsonl
+set -- $SSH_ORIGINAL_COMMAND
+verb=${1:-}
+SYSCTL=${SYSTEMCTL:-/usr/bin/systemctl}
+case "$verb" in
+  read)
+    [ -s "$LOG" ] && mv "$LOG" "$DIR/metrics.$(date +%s%N).reading"
+    shopt -s nullglob
+    for f in "$DIR"/metrics.*.reading; do b=${f##*/}; echo "#F $b"; cat "$f"; done
+    echo "#END" ;;
+  ack)
+    [[ "${2:-}" =~ ^metrics\.[0-9]+\.reading$ ]] || { echo "bad ack" >&2; exit 2; }
+    n=${2#metrics.}; n=${n%.reading}
+    shopt -s nullglob
+    for f in "$DIR"/metrics.*.reading; do b=${f##*/}; m=${b#metrics.}; m=${m%.reading}; [ "$m" -le "$n" ] && rm -f "$f"; done
+    echo ok ;;
+  info) cat "$DIR/static.json" ;;
+  power-off) echo ok; sudo -n "$SYSCTL" "power""off" ;;
+  reboot) echo ok; sudo -n "$SYSCTL" "re""boot" ;;
+  *) echo "denied" >&2; exit 2 ;;
+esac
