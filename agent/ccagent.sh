@@ -54,8 +54,71 @@ rapl_max=0; [ -n "$RAPL" ] && rapl_max=$(< "$RAPL/max_energy_range_uj")
 cpu_uj_acc=0; last_raw=; last_ts=0
 prev_total=0; prev_idle=0
 
+# ---- disks (every source optional: a missing one yields null, never breaks the loop) ----
+DISKSTATS=${CCAGENT_DISKSTATS:-/proc/diskstats}
+HWMON_ROOT=${CCAGENT_HWMON:-/sys/class/hwmon}
+DF=${CCAGENT_DF:-df}
+MAX_SAMPLES=${CCAGENT_MAX_SAMPLES:-0}   # test hook; 0 = run forever
+# whole devices only: partitions (sda1, nvme0n1p1, mmcblk0p1) and loop/ram/dm- are skipped
+is_whole_disk() {
+  case $1 in loop*|ram*|dm-*) return 1;; esac
+  case $1 in
+    nvme*|mmcblk*) [[ $1 =~ p[0-9]+$ ]] && return 1;;
+    sd*|hd*|vd*|xvd*) [[ $1 =~ [0-9]$ ]] && return 1;;
+  esac
+  return 0
+}
+prev_dr=-1; prev_dw=-1; prev_dts=0
+sample_no=0
+
 while :; do
   ts=$EPOCHSECONDS
+  # disk I/O rate: whole-device sector deltas, KB/s over the measured interval
+  disk_read_kbs=null; disk_write_kbs=null
+  if [ -r "$DISKSTATS" ]; then
+    DR=0; DW=0
+    while read -r _ _ dname _ _ rs _ _ _ ws _; do
+      is_whole_disk "$dname" || continue
+      DR=$((DR+rs)); DW=$((DW+ws))
+    done 2>/dev/null < "$DISKSTATS"
+    if [ $prev_dr -ge 0 ]; then
+      el=$((ts-prev_dts)); [ $el -le 0 ] && el=1
+      dr=$((DR-prev_dr)); [ $dr -lt 0 ] && dr=0
+      dw=$((DW-prev_dw)); [ $dw -lt 0 ] && dw=0
+      disk_read_kbs=$((dr*512/1024/el)); disk_write_kbs=$((dw*512/1024/el))
+    fi
+    prev_dr=$DR; prev_dw=$DW; prev_dts=$ts
+  fi
+  # disk temperature: hottest nvme/drivetemp sensor, whole degrees C
+  disk_temp_c=null
+  for h in "$HWMON_ROOT"/hwmon*; do
+    [ -r "$h/name" ] || continue
+    case $(< "$h/name") in nvme|drivetemp) ;; *) continue;; esac
+    read -r dt < "$h/temp1_input" 2>/dev/null || continue
+    [[ $dt =~ ^-?[0-9]+$ ]] || continue
+    c=$((dt/1000))
+    if [ "$disk_temp_c" = null ] || [ $c -gt $disk_temp_c ]; then disk_temp_c=$c; fi
+  done
+  # used% of the filesystem at /
+  disk_used_pct=$($DF -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+  [[ $disk_used_pct =~ ^[0-9]+$ ]] || disk_used_pct=null
+  # mount table: first sample and every 12th
+  disks_part=
+  if [ $((sample_no % 12)) -eq 0 ] && df_out=$($DF -PT -BM 2>/dev/null); then
+    disks_part=",\"disks\":[$(printf '%s\n' "$df_out" | awk '
+      function esc(s) { gsub(/\\/, "&&", s); gsub(/"/, "\\\"", s); return s }
+      NR == 1 { next }
+      {
+        fs = $2; tot = $3; used = $4; m = $0
+        for (i = 1; i <= 6; i++) sub(/^[ \t]*[^ \t]+/, "", m)
+        sub(/^[ \t]+/, "", m)
+        if (fs ~ /^(tmpfs|devtmpfs|squashfs|overlay|efivarfs)$/) next
+        if (m ~ /^\/(run|sys|proc|dev|snap)(\/|$)/ || m ~ /^\/var\/lib\/docker(\/|$)/) next
+        gsub(/M$/, "", tot); gsub(/M$/, "", used)
+        out = out (k++ ? "," : "") "{\"m\":\"" esc(m) "\",\"fs\":\"" esc(fs) "\",\"total_mb\":" tot + 0 ",\"used_mb\":" used + 0 "}"
+      }
+      END { printf "%s", out }')]"
+  fi
   # CPU %
   read -r _ u n s i io irq sirq st _ < /proc/stat
   total=$((u+n+s+i+io+irq+sirq+st)); idle=$((i+io))
@@ -104,9 +167,10 @@ while :; do
   elif [ $GPU_KIND = nvidia ]; then
     IFS=', ' read -r gpu_pct vram_used gpu_mhz gpu_w _ < <(nvidia-smi --query-gpu=utilization.gpu,memory.used,clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null)
   fi
-  printf '{"v":1,"ts":%s,"cpu_pct":%s,"cpu_mhz":%s,"cpu_w":%s,"cpu_uj":%s,"gpu_pct":%s,"gpu_mhz":%s,"vram_used_mb":%s,"gpu_w":%s,"gpu_uj":null,"ram_used_mb":%s,"ram_free_mb":%s,"ram_cached_mb":%s,"swap_used_mb":%s}\n' \
+  printf '{"v":1,"ts":%s,"cpu_pct":%s,"cpu_mhz":%s,"cpu_w":%s,"cpu_uj":%s,"gpu_pct":%s,"gpu_mhz":%s,"vram_used_mb":%s,"gpu_w":%s,"gpu_uj":null,"ram_used_mb":%s,"ram_free_mb":%s,"ram_cached_mb":%s,"swap_used_mb":%s,"disk_read_kbs":%s,"disk_write_kbs":%s,"disk_temp_c":%s,"disk_used_pct":%s%s}\n' \
     "$ts" "${cpu_pct:-null}" "${cpu_mhz:-null}" "$cpu_w" "$cpu_uj" "${gpu_pct:-null}" "${gpu_mhz:-null}" "${vram_used:-null}" "${gpu_w:-null}" \
-    "$ram_used" "$ram_free" "$ram_cached" "$swap_used" >> "$LOG"
+    "$ram_used" "$ram_free" "$ram_cached" "$swap_used" "$disk_read_kbs" "$disk_write_kbs" "$disk_temp_c" "$disk_used_pct" "$disks_part" >> "$LOG"
+  sample_no=$((sample_no+1)); [ "$MAX_SAMPLES" -gt 0 ] && [ $sample_no -ge "$MAX_SAMPLES" ] && break
   # cap log size when nobody reads it
   if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt $MAX_BYTES ]; then
     tail -c $((MAX_BYTES/2)) "$LOG" | tail -n +2 > "$LOG.trim" && mv "$LOG.trim" "$LOG"

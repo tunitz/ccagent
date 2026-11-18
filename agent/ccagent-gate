@@ -5,8 +5,48 @@ CONF=${CCAGENT_CONF:-/etc/ccagent.conf}
 DIR=/var/lib/ccagent; [ -r "$CONF" ] && . "$CONF"
 LOG=$DIR/metrics.jsonl
 POWER_UNIT=${POWER_UNIT:-/etc/systemd/system/ccagent-power.path}
-set -- $SSH_ORIGINAL_COMMAND
-verb=${1:-}
+SVC_UNIT=${SVC_UNIT:-/etc/systemd/system/ccagent-svc.path}
+SVC_WAIT=${CCAGENT_SVC_WAIT:-8}
+LOCK_WAIT=${CCAGENT_SVC_LOCK_WAIT:-20}
+# Parse only fixed positional words; never execute or interpolate a supplied word.
+read -r -a args <<< "${SSH_ORIGINAL_COMMAND:-}"
+verb=${args[0]:-}
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9@._:-]{0,127}$ ]]; }
+# user items are "<username>:<unit>": the username (no ':') comes first, the unit may contain ':'.
+valid_item() { if [ "$1" = user ]; then [[ "$2" =~ ^[a-z_][a-z0-9_-]{0,31}:[A-Za-z0-9][A-Za-z0-9@._:-]{0,127}$ ]]; else valid_name "$2"; fi; }
+valid_kind() { [[ "$1" == systemd || "$1" == docker || "$1" == lxc || "$1" == user ]]; }
+svc_request() {
+  [ -f "$SVC_UNIT" ] || { echo "svc helper missing: re-run the installer" >&2; exit 3; }
+  # Serialize the whole request/response cycle: concurrent callers queue here instead of colliding on svc.request.
+  # The lock is an fd held until this process exits. Without flock (util-linux) fall back to the old single-slot behaviour.
+  if command -v flock >/dev/null 2>&1; then
+    exec {LFD}>"$DIR/.svc.lock" || { echo "svc helper busy" >&2; exit 3; }
+    flock -w "$LOCK_WAIT" "$LFD" || { echo "svc helper busy" >&2; exit 3; }
+  fi
+  # Under the lock, a request file can only be ours-from-a-crashed-run (stale) or a genuinely stuck helper.
+  if [ -e "$DIR/svc.request" ]; then
+    mt=$(stat -c %Y "$DIR/svc.request" 2>/dev/null) || mt=$(date +%s)
+    if (( $(date +%s) - mt > 150 )); then rm -f "$DIR/svc.request"; else echo "svc helper busy" >&2; exit 3; fi
+  fi
+  id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n'); tmp="$DIR/.svc.request.$$"; body=''
+  if [ "$verb" = svc-allow ]; then
+    body=$(head -c 65537)
+    [ "${#body}" -le 65536 ] || { echo denied >&2; exit 2; }
+  fi
+  local reqaction="${4:-}" reqn=200
+  if [ "$1" = logs ]; then reqaction=''; reqn="${4:-200}"; fi
+  # svc_request gets only validated fixed words; the helper re-validates before any tool call.
+  printf '{"id":"%s","verb":"%s","kind":"%s","name":"%s","action":"%s","n":%s,"ts":%s}\n%s' "$id" "$1" "${2:-}" "${3:-}" "$reqaction" "$reqn" "$(date +%s)" "$body" > "$tmp"
+  chmod 600 "$tmp"; mv -n "$tmp" "$DIR/svc.request" || { rm -f "$tmp"; echo "svc helper busy" >&2; exit 3; }
+  for ((i=0;i<SVC_WAIT*10;i++)); do
+    if [ -f "$DIR/svc.result.$id" ]; then
+      cat "$DIR/svc.result.$id"; local ok; ok=$(python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("ok",False)).lower())' < "$DIR/svc.result.$id" 2>/dev/null)
+      rm -f "$DIR/svc.result.$id"; [ "$ok" = true ] && exit 0 || exit 3
+    fi
+    sleep .1
+  done
+  rm -f "$DIR/svc.request"; echo "svc helper timeout" >&2; exit 3
+}
 case "$verb" in
   read)
     [ -s "$LOG" ] && mv "$LOG" "$DIR/metrics.$(date +%s%N).reading"
@@ -14,12 +54,27 @@ case "$verb" in
     for f in "$DIR"/metrics.*.reading; do b=${f##*/}; echo "#F $b"; cat "$f"; done
     echo "#END" ;;
   ack)
-    [[ "${2:-}" =~ ^metrics\.[0-9]+\.reading$ ]] || { echo "bad ack" >&2; exit 2; }
-    n=${2#metrics.}; n=${n%.reading}
+    [ "${#args[@]}" -eq 2 ] && [[ "${args[1]}" =~ ^metrics\.[0-9]+\.reading$ ]] || { echo "bad ack" >&2; exit 2; }
+    n=${args[1]#metrics.}; n=${n%.reading}
     shopt -s nullglob
     for f in "$DIR"/metrics.*.reading; do b=${f##*/}; m=${b#metrics.}; m=${m%.reading}; [ "$m" -le "$n" ] && rm -f "$f"; done
     echo ok ;;
   info) cat "$DIR/static.json" ;;
+  svc-list|svc-discover)
+    [ "${#args[@]}" -eq 1 ] || { echo denied >&2; exit 2; }
+    svc_request "${verb#svc-}" ;;
+  svc-act)
+    [ "${#args[@]}" -eq 4 ] && valid_kind "${args[1]}" && valid_item "${args[1]}" "${args[2]}" && [[ "${args[3]}" =~ ^(start|stop|restart)$ ]] || { echo denied >&2; exit 2; }
+    [ "${args[1]}" != lxc ] || [[ "${args[2]}" =~ ^[0-9]{1,9}$ ]] || { echo denied >&2; exit 2; }
+    svc_request act "${args[1]}" "${args[2]}" "${args[3]}" ;;
+  svc-logs)
+    [ "${#args[@]}" -eq 4 ] && valid_kind "${args[1]}" && valid_item "${args[1]}" "${args[2]}" && [[ "${args[3]}" =~ ^[0-9]+$ ]] || { echo denied >&2; exit 2; }
+    [ "${args[1]}" != lxc ] || [[ "${args[2]}" =~ ^[0-9]{1,9}$ ]] || { echo denied >&2; exit 2; }
+    n=${args[3]}; (( n < 1 )) && n=1; (( n > 500 )) && n=500
+    svc_request logs "${args[1]}" "${args[2]}" "$n" ;;
+  svc-allow)
+    [ "${#args[@]}" -eq 1 ] || { echo denied >&2; exit 2; }
+    svc_request allow ;;
   power-off|reboot)
     # No sudo needed: drop a request file; a root-owned systemd path unit picks it up and runs the matching action.
     [ -f "$POWER_UNIT" ] || { echo "power control not installed on this unit: re-run the installer to enable it" >&2; exit 3; }
