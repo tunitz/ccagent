@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Root-owned service-control request executor. Commands are argv-only, never shell strings."""
-import json, os, re, subprocess, time, tempfile
+import json, os, re, stat, subprocess, time, tempfile, uuid
 
 DIR = os.environ.get('CCAGENT_DIR', '/var/lib/ccagent')
 REQ = os.environ.get('CCAGENT_REQ', DIR + '/svc.request')
@@ -49,6 +49,10 @@ def user_target(name):
 def run(argv, timeout=30):
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        # Log commands such as journalctl write diagnostics to stderr on success: pass both
+        # streams to the caller instead of silently discarding them.
+        if 'logs' in argv and p.stderr and os.environ.get('CCAGENT_DOCKER_LOGS', '1') == '1':
+            return p.stdout + '\n' + p.stderr
         if p.returncode: raise RuntimeError((p.stderr or p.stdout or 'command failed').strip()[:1000])
         return p.stdout
     except FileNotFoundError:
@@ -155,7 +159,7 @@ def journal_lines(out):
             rows.append({'ts':int(x.get('__REALTIME_TIMESTAMP',0))//1000,'level':journal_level(x.get('PRIORITY'),msg),'msg':truncate(msg)})
         except Exception: pass
     return list(reversed(rows))
-def docker_lines(out):
+def docker_lines(out, err=''):
     rows=[]
     stamp=re.compile(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))\s?(.*)$')
     for line in out.splitlines():
@@ -222,9 +226,13 @@ def process(r, body):
 
 def main():
     try:
-        with open(REQ,'rb') as f: raw=f.read(70000)
+        fd=os.open(REQ, os.O_RDONLY | getattr(os,'O_NOFOLLOW',0))
+        st=os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid(): os.close(fd); return
+        with os.fdopen(fd,'rb') as f: raw=f.read(70000)
         os.unlink(REQ)
     except FileNotFoundError: return
+    except OSError: return
     try:
         rline,body=raw.decode('utf-8').split('\n',1); r=json.loads(rline)
         ident=r.get('id','')
@@ -236,10 +244,24 @@ def main():
     except PermissionError as e: result={'ok':False,'code':'denied','error':str(e)}
     except ValueError as e: result={'ok':False,'code':'bad_request','error':str(e)}
     except Exception as e: result={'ok':False,'code':'failed','error':str(e)[:1000]}
-    path=DIR+'/svc.result.'+ident
-    tmp=path+'.tmp';
-    with open(tmp,'w') as f: json.dump(result,f); f.write('\n')
-    # Runs as root; the gate (owner of DIR) must read and delete the result, so hand it to DIR's owner.
-    st=os.stat(DIR); os.chown(tmp,st.st_uid,st.st_gid)
-    os.chmod(tmp,0o600); os.replace(tmp,path)
+    # The result directory is owned by the gate user so it can read and delete results.
+    # Root publishes a result safely: O_EXCL|O_NOFOLLOW on a fresh random name prevents
+    # a planted symlink or pre-created file from redirecting the write, and fchown acts
+    # only on the fd root just created (never on a caller-chosen path).
+    result_dir = os.environ.get('RESULTS_DIR', '/run/ccagent')
+    dst = os.stat(result_dir)
+    path=result_dir+'/svc.result.'+ident
+    tmp=path+'.tmp-'+uuid.uuid4().hex
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,'O_NOFOLLOW',0)
+    fd=os.open(tmp, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode): os.close(fd); return
+        with os.fdopen(fd,'w') as f: json.dump(result,f); f.write('\n')
+        # fd is closed by fdopen; reopen by the same verified inode for fchown.
+        fd2=os.open(tmp, os.O_WRONLY | getattr(os,'O_NOFOLLOW',0))
+        os.fchown(fd2, dst.st_uid, dst.st_gid); os.close(fd2)
+        os.replace(tmp,path)
+    except OSError:
+        try: os.unlink(tmp)
+        except OSError: pass
 if __name__=='__main__': main()

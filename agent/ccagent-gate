@@ -8,6 +8,7 @@ POWER_UNIT=${POWER_UNIT:-/etc/systemd/system/ccagent-power.path}
 SVC_UNIT=${SVC_UNIT:-/etc/systemd/system/ccagent-svc.path}
 SVC_WAIT=${CCAGENT_SVC_WAIT:-8}
 LOCK_WAIT=${CCAGENT_SVC_LOCK_WAIT:-20}
+RESULTS_DIR=${RESULTS_DIR:-${CCAGENT_RESULTS:-/run/ccagent}}
 # Parse only fixed positional words; never execute or interpolate a supplied word.
 read -r -a args <<< "${SSH_ORIGINAL_COMMAND:-}"
 verb=${args[0]:-}
@@ -38,10 +39,14 @@ svc_request() {
   # svc_request gets only validated fixed words; the helper re-validates before any tool call.
   printf '{"id":"%s","verb":"%s","kind":"%s","name":"%s","action":"%s","n":%s,"ts":%s}\n%s' "$id" "$1" "${2:-}" "${3:-}" "$reqaction" "$reqn" "$(date +%s)" "$body" > "$tmp"
   chmod 600 "$tmp"; mv -n "$tmp" "$DIR/svc.request" || { rm -f "$tmp"; echo "svc helper busy" >&2; exit 3; }
-  for ((i=0;i<SVC_WAIT*10;i++)); do
-    if [ -f "$DIR/svc.result.$id" ]; then
-      cat "$DIR/svc.result.$id"; local ok; ok=$(python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("ok",False)).lower())' < "$DIR/svc.result.$id" 2>/dev/null)
-      rm -f "$DIR/svc.result.$id"; [ "$ok" = true ] && exit 0 || exit 3
+  # Action commands can take up to 40s in the server; the helper may still be running after the
+  # caller gives up. Keep polling for the result rather than deleting a request in flight.
+  local wait=$SVC_WAIT
+  [ "$verb" = act ] && wait=45
+  for ((i=0;i<wait*10;i++)); do
+    if [ -f "$RESULTS_DIR/svc.result.$id" ]; then
+      cat "$RESULTS_DIR/svc.result.$id"; local ok; ok=$(python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("ok",False)).lower())' < "$RESULTS_DIR/svc.result.$id" 2>/dev/null)
+      rm -f "$RESULTS_DIR/svc.result.$id"; [ "$ok" = true ] && exit 0 || exit 3
     fi
     sleep .1
   done

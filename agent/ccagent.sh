@@ -109,13 +109,13 @@ while :; do
       function esc(s) { gsub(/\\/, "&&", s); gsub(/"/, "\\\"", s); return s }
       NR == 1 { next }
       {
-        fs = $2; tot = $3; used = $4; m = $0
+        fs = $2; tot = $3; used = $4; avail = $5; m = $0
         for (i = 1; i <= 6; i++) sub(/^[ \t]*[^ \t]+/, "", m)
         sub(/^[ \t]+/, "", m)
         if (fs ~ /^(tmpfs|devtmpfs|squashfs|overlay|efivarfs)$/) next
         if (m ~ /^\/(run|sys|proc|dev|snap)(\/|$)/ || m ~ /^\/var\/lib\/docker(\/|$)/) next
-        gsub(/M$/, "", tot); gsub(/M$/, "", used)
-        out = out (k++ ? "," : "") "{\"m\":\"" esc(m) "\",\"fs\":\"" esc(fs) "\",\"total_mb\":" tot + 0 ",\"used_mb\":" used + 0 "}"
+        gsub(/M$/, "", tot); gsub(/M$/, "", used); gsub(/M$/, "", avail)
+        out = out (k++ ? "," : "") "{\"m\":\"" esc(m) "\",\"fs\":\"" esc(fs) "\",\"total_mb\":" tot + 0 ",\"used_mb\":" used + 0 ",\"avail_mb\":" avail + 0 "}"
       }
       END { printf "%s", out }')]"
   fi
