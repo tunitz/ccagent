@@ -20,12 +20,16 @@ rm -rf /etc/ccagent
 # created by someone else is never touched. Legacy installs without a manifest fall back
 # to the old comment-based match for ufw only.
 FW_MARKER=""; FW_UFW=0; FW_FIREDALD=0; FW_NFT=0; FW_IPTABLES=0; FW_IP6=0; HAVE_MANIFEST=0
+FW_NFT_FAMILY=inet; FW_NFT_TABLE=filter; FW_NFT_CHAIN=input
 if [ -r /etc/ccagent/firewall.json ]; then
   HAVE_MANIFEST=1
   FW_MARKER=$(python3 -c 'import json;print(json.load(open("/etc/ccagent/firewall.json")).get("marker",""))' 2>/dev/null || true)
   FW_UFW=$(python3 -c 'import json;print(int(bool(json.load(open("/etc/ccagent/firewall.json")).get("ufw"))))' 2>/dev/null || echo 0)
   FW_FIREDALD=$(python3 -c 'import json;print(int(bool(json.load(open("/etc/ccagent/firewall.json")).get("firewalld"))))' 2>/dev/null || echo 0)
   FW_NFT=$(python3 -c 'import json;print(int(bool(json.load(open("/etc/ccagent/firewall.json")).get("nft"))))' 2>/dev/null || echo 0)
+  FW_NFT_FAMILY=$(python3 -c 'import json;print(json.load(open("/etc/ccagent/firewall.json")).get("nft_family","inet"))' 2>/dev/null || echo inet)
+  FW_NFT_TABLE=$(python3 -c 'import json;print(json.load(open("/etc/ccagent/firewall.json")).get("nft_table","filter"))' 2>/dev/null || echo filter)
+  FW_NFT_CHAIN=$(python3 -c 'import json;print(json.load(open("/etc/ccagent/firewall.json")).get("nft_chain","input"))' 2>/dev/null || echo input)
   FW_IPTABLES=$(python3 -c 'import json;print(int(bool(json.load(open("/etc/ccagent/firewall.json")).get("iptables"))))' 2>/dev/null || echo 0)
   FW_IP6=$(python3 -c 'import json;print(int(bool(json.load(open("/etc/ccagent/firewall.json")).get("ip6tables"))))' 2>/dev/null || echo 0)
 else
@@ -47,8 +51,8 @@ if [ "$FW_FIREDALD" = 1 ] && command -v firewall-cmd >/dev/null 2>&1 && [ "$(fir
 fi
 if [ "$FW_NFT" = 1 ] && command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
   # Delete by handle so only the marked rule goes, not another port rule.
-  HANDLES=$(nft -a list chain inet filter input 2>/dev/null | grep "$FW_MARKER" | sed -E 's/.*handle ([0-9]+).*/\1/')
-  for h in $HANDLES; do nft delete rule inet filter input handle "$h" >/dev/null 2>&1 || true; done
+  HANDLES=$(nft -a list chain "$FW_NFT_FAMILY" "$FW_NFT_TABLE" "$FW_NFT_CHAIN" 2>/dev/null | grep "$FW_MARKER" | sed -E 's/.*handle ([0-9]+).*/\1/')
+  for h in $HANDLES; do nft delete rule "$FW_NFT_FAMILY" "$FW_NFT_TABLE" "$FW_NFT_CHAIN" handle "$h" >/dev/null 2>&1 || true; done
 elif [ "$HAVE_MANIFEST" = 0 ] && command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
   echo "NOTE: nftables detected on a legacy install. If you added a ccagent rule for port $SSH_PORT, remove it manually:"
   echo "  nft list chain inet filter input   # find 'tcp dport $SSH_PORT accept' and delete by handle"
